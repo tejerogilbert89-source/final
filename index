@@ -1,0 +1,305 @@
+<?php
+/**
+ * Placeholder screen - not designed yet. Real content comes next,
+ * one module at a time.
+ */
+$layout = 'staff';
+Auth::requireLogin();
+?>
+
+<?php
+/* LibraryFines - single-file PHP app (PHP 7.4+, SQLite via PDO)
+   Run: php -S localhost:8000   (or place in htdocs and open /index.php) */
+if (session_status() !== PHP_SESSION_ACTIVE) {
+    session_start();
+}
+date_default_timezone_set('Asia/Manila');
+const RATE = 5; // peso fine per overdue day
+
+if (!extension_loaded('pdo_sqlite')) {
+    http_response_code(500);
+    die('The PHP "pdo_sqlite" extension is not enabled. In XAMPP, open php.ini, '
+      . 'remove the leading ";" from ";extension=pdo_sqlite", then restart Apache.');
+}
+
+try {
+    $db = new PDO('sqlite:' . __DIR__ . '/library.db');
+    $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    $db->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+} catch (PDOException $e) {
+    http_response_code(500);
+    die('Could not open the fines database. Make sure this folder is writable: ' . __DIR__);
+}
+
+$db->exec("CREATE TABLE IF NOT EXISTS loans(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, student_id TEXT, course TEXT NOT NULL,
+  year_level TEXT, contact TEXT, book_title TEXT NOT NULL, author TEXT, book_no TEXT,
+  borrow_date TEXT NOT NULL, due_date TEXT NOT NULL, returned_on TEXT,
+  fine_paid REAL NOT NULL DEFAULT 0, fine_paid_on TEXT)");
+
+/* Migration: older databases won't have these two columns yet.
+   fine_total freezes the fine amount at the moment the book record is erased
+   (once book_title/due_date etc. are wiped, the fine can no longer be recalculated
+   from them). erased marks a record as "book info gone, fine kept". */
+$existingCols = array_column($db->query("PRAGMA table_info(loans)")->fetchAll(), 'name');
+if (!in_array('fine_total', $existingCols, true)) {
+    $db->exec("ALTER TABLE loans ADD COLUMN fine_total REAL");
+}
+if (!in_array('erased', $existingCols, true)) {
+    $db->exec("ALTER TABLE loans ADD COLUMN erased INTEGER NOT NULL DEFAULT 0");
+}
+
+$_SESSION['t'] = $_SESSION['t'] ?? bin2hex(random_bytes(16));
+function h($s){ return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8'); }
+function money($n){ return '₱' . number_format((float)$n, 2); }
+function fdate($d){ return date('M j, Y', strtotime($d)); }
+function daysBetween($a, $b){ return (int)(new DateTime($a))->diff(new DateTime($b))->format('%r%a'); }
+function plural($n, $w){ return "$n $w" . ($n == 1 ? '' : 's'); }
+
+/* Fine = RATE x days overdue.
+   Book not returned: counted up to today (grows daily). Returned: frozen at the return date.
+   Erased: frozen at whatever it was the moment the book record was erased (fine_total).
+   Fine status: PAID when nothing is left to pay, UNPAID when a balance remains, NO FINE when 0. */
+function calc(array $r): array {
+  if (!empty($r['erased'])) {
+    $fine    = (float)$r['fine_total'];
+    $balance = max(0, $fine - (float)$r['fine_paid']);
+    $status  = $fine == 0 ? 'NO FINE' : ($balance <= 0 ? 'PAID' : 'UNPAID');
+    return ['over' => null, 'fine' => $fine, 'balance' => $balance, 'fstatus' => $status, 'book' => 'Erased'];
+  }
+
+  $end     = $r['returned_on'] ?: date('Y-m-d');
+  $over    = max(0, daysBetween($r['due_date'], $end));
+  $fine    = $over * RATE;
+  $balance = max(0, $fine - (float)$r['fine_paid']);
+  $status  = $fine == 0 ? 'NO FINE' : ($balance <= 0 ? 'PAID' : 'UNPAID');
+  $book    = $r['returned_on'] ? 'Returned' : ($over > 0 ? 'Overdue' : 'Borrowed');
+  return ['over' => $over, 'fine' => $fine, 'balance' => $balance, 'fstatus' => $status, 'book' => $book];
+}
+
+/* ---------- actions (POST, then redirect) ---------- */
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+  if (!hash_equals($_SESSION['t'], $_POST['t'] ?? '')) { http_response_code(400); exit('Invalid session token.'); }
+  $a = $_POST['action'] ?? ''; $id = (int)($_POST['id'] ?? 0);
+  $back = $_POST['back'] ?? 'index.php'; if (strpos($back, 'index.php') !== 0) $back = 'index.php';
+  $today = date('Y-m-d');
+
+  if ($a === 'return') {
+    $q = $db->prepare("SELECT erased FROM loans WHERE id=?"); $q->execute([$id]);
+    if (($row = $q->fetch()) && !$row['erased']) {
+      $db->prepare("UPDATE loans SET returned_on=? WHERE id=?")->execute([$today, $id]);
+    }
+    header("Location: $back"); exit;
+  }
+  elseif ($a === 'unreturn') {
+    $q = $db->prepare("SELECT erased FROM loans WHERE id=?"); $q->execute([$id]);
+    if (($row = $q->fetch()) && !$row['erased']) {
+      $db->prepare("UPDATE loans SET returned_on=NULL WHERE id=?")->execute([$id]);
+    }
+    header("Location: $back"); exit;
+  }
+  elseif ($a === 'payfine') { // pay the current fine in full -> status becomes PAID automatically
+    $q = $db->prepare("SELECT * FROM loans WHERE id=?"); $q->execute([$id]);
+    if ($r = $q->fetch()) { $c = calc($r); $db->prepare("UPDATE loans SET fine_paid=?, fine_paid_on=? WHERE id=?")->execute([$c['fine'], $today, $id]); }
+    header("Location: $back"); exit;
+  }
+  elseif ($a === 'erase') {
+    // Wipe the borrowed-book details, but freeze and keep the fine so it isn't lost.
+    $q = $db->prepare("SELECT * FROM loans WHERE id=?"); $q->execute([$id]);
+    if ($r = $q->fetch()) {
+      $c = calc($r); // the fine as it stands right now, before the book info disappears
+      $db->prepare(
+        "UPDATE loans SET
+           book_title = '', author = NULL, book_no = NULL,
+           course = '', year_level = NULL, contact = NULL,
+           fine_total = ?, erased = 1
+         WHERE id = ?"
+      )->execute([$c['fine'], $id]);
+    }
+    header("Location: $back"); exit;
+  }
+  elseif ($a === 'delete') { $db->prepare("DELETE FROM loans WHERE id=?")->execute([$id]); header("Location: $back"); exit; }
+  elseif ($a === 'demo') {
+    $s = $db->prepare("INSERT INTO loans(name,student_id,course,year_level,contact,book_title,author,book_no,borrow_date,due_date,returned_on,fine_paid,fine_paid_on) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)");
+    $d = fn($o) => date('Y-m-d', strtotime("$o days"));
+    $s->execute(['Gilbert Tejero','2023-00142','BS Information Technology','3rd Year','0917 555 0142','Introduction to Algorithms','Cormen et al.','QA76.6-0142',$d(-13),$d(-6),null,0,null]);
+    $s->execute(['Maria Santos','2022-00871','BS Nursing','4th Year','0928 555 0871','Fundamentals of Nursing','Potter & Perry','RT41-0871',$d(-15),$d(-8),$d(-3),25,$d(-3)]);
+    $s->execute(['Paolo Reyes','2024-00310','BS Accountancy','2nd Year','0905 555 0310','Intermediate Accounting','Kieso','HF5635-0310',$d(-2),$d(5),null,0,null]);
+    $s->execute(['Angela Cruz','2023-00655','BS Education','3rd Year','0936 555 0655','Philippine History','Zaide','DS668-0655',$d(-12),$d(-5),$d(-1),0,null]);
+    header('Location: index.php'); exit;
+  }
+}
+
+/* ---------- data for the page ---------- */
+$f = in_array($_GET['f'] ?? '', ['borrowed','overdue','returned','unpaid','erased'], true) ? $_GET['f'] : 'all';
+$search = trim($_GET['q'] ?? '');
+$all = $db->query("SELECT * FROM loans")->fetchAll();
+foreach ($all as &$r) { $r += calc($r); } unset($r);
+
+$out   = array_filter($all, fn($r) => !$r['returned_on'] && !$r['erased']);
+$over  = array_filter($all, fn($r) => $r['book'] === 'Overdue');
+$ret   = array_filter($all, fn($r) => $r['returned_on'] && !$r['erased']);
+$unpd  = array_filter($all, fn($r) => $r['fstatus'] === 'UNPAID');
+$erd   = array_filter($all, fn($r) => $r['erased']);
+$sum   = fn($a, $k) => array_sum(array_column($a, $k));
+$collected = array_sum(array_map(fn($r) => min((float)$r['fine_paid'], $r['fine']), $all));
+$counts = ['all' => count($all), 'borrowed' => count($out), 'overdue' => count($over), 'returned' => count($ret), 'unpaid' => count($unpd), 'erased' => count($erd)];
+
+$rows = array_filter($all, function ($r) use ($f, $search) {
+  if ($f === 'borrowed' && ($r['returned_on'] || $r['erased'])) return false;
+  if ($f === 'overdue' && $r['book'] !== 'Overdue') return false;
+  if ($f === 'returned' && (!$r['returned_on'] || $r['erased'])) return false;
+  if ($f === 'unpaid' && $r['fstatus'] !== 'UNPAID') return false;
+  if ($f === 'erased' && !$r['erased']) return false;
+  return $search === '' || stripos($r['name'].' '.$r['student_id'].' '.$r['course'].' '.$r['book_title'].' '.$r['author'].' '.$r['book_no'], $search) !== false;
+});
+usort($rows, fn($a, $b) => ($a['returned_on'] ? 1 : 0) <=> ($b['returned_on'] ? 1 : 0) ?: strcmp($a['due_date'], $b['due_date']));
+$back = 'index.php' . (!empty($_SERVER['QUERY_STRING']) ? '?' . $_SERVER['QUERY_STRING'] : '');
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>&amp; Fines</title>
+<style>
+:root{--bg:#eaf7ef;--card:#ffffff;--ink:#0d2a1a;--mute:#4c6e5a;--line:#cdead9;--acc:#149355;--acc2:#0d7a45;--accfg:#fff;--paid:#0f7a4a;--paidbg:#d8f3e3;--over:#b3261e;--overbg:#fbe4e2;--unp:#7a5b00;--unpbg:#fff2c2;--nfbg:#e5f2ea}
+@media(prefers-color-scheme:dark){:root{--bg:#07180f;--card:#0f2519;--ink:#e6f6ec;--mute:#8fbba1;--line:#1b3d2a;--acc:#33d97e;--acc2:#22c26c;--accfg:#04140b;--paid:#5fe3a4;--paidbg:#0f3626;--over:#ff8f86;--overbg:#40181a;--unp:#f0d066;--nfbg:#132a1e}}
+*{box-sizing:border-box}html,body{margin:0}
+body{background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;position:relative;min-height:100vh;overflow-x:hidden}
+body::before{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;background:
+  radial-gradient(ellipse at top left, rgba(20,147,85,.14), transparent 55%),
+  radial-gradient(ellipse at bottom right, rgba(13,122,69,.16), transparent 55%)}
+.books-bg{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden}
+.books-bg span{position:absolute;font-size:44px;opacity:.12;filter:sepia(.3) hue-rotate(60deg) saturate(1.4);animation:floatBook ease-in-out infinite}
+@media(prefers-color-scheme:dark){.books-bg span{opacity:.16}}
+.books-bg span:nth-child(1){top:5%;left:4%;font-size:60px;animation-duration:18s}
+.books-bg span:nth-child(2){top:14%;left:84%;font-size:42px;animation-duration:14s;animation-delay:-3s}
+.books-bg span:nth-child(3){top:40%;left:8%;font-size:36px;animation-duration:16s;animation-delay:-6s}
+.books-bg span:nth-child(4){top:58%;left:88%;font-size:56px;animation-duration:15s;animation-delay:-2s}
+.books-bg span:nth-child(5){top:76%;left:12%;font-size:44px;animation-duration:19s;animation-delay:-9s}
+.books-bg span:nth-child(6){top:84%;left:68%;font-size:38px;animation-duration:13s;animation-delay:-5s}
+.books-bg span:nth-child(7){top:3%;left:50%;font-size:34px;animation-duration:17s;animation-delay:-8s}
+.books-bg span:nth-child(8){top:30%;left:96%;font-size:32px;animation-duration:12s;animation-delay:-1s}
+@keyframes floatBook{0%{transform:translateY(0) rotate(-4deg)}50%{transform:translateY(-24px) rotate(5deg)}100%{transform:translateY(0) rotate(-4deg)}}
+.wrap{max-width:940px;margin:0 auto;padding:20px 16px 48px;position:relative;z-index:1}
+h1{font-size:26px;letter-spacing:-.02em;margin:0 0 2px}h2{font-size:16px;margin:0 0 12px}.mute{color:var(--mute);margin:0 0 16px}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;min-width:0}
+.stat b{display:block;font-size:20px;overflow-wrap:anywhere}.stat span{color:var(--mute);font-size:13px}
+.stat.hot{border-color:var(--over)}.stat.hot b{color:var(--over)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:14px;box-shadow:0 6px 20px -12px rgba(13,122,69,.35)}
+h1{background:linear-gradient(90deg,var(--acc2),var(--acc));-webkit-background-clip:text;background-clip:text;color:transparent}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
+label{display:flex;flex-direction:column;gap:4px;font-size:13px;color:var(--mute);font-weight:500}
+input,select{font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:9px 10px;width:100%;min-width:0}
+input:focus-visible,select:focus-visible,button:focus-visible,a:focus-visible{outline:2px solid var(--acc);outline-offset:1px}
+.err{color:var(--over);font-size:13px;margin:8px 0 0}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.btn{font:inherit;font-weight:600;font-size:13px;border:1px solid var(--line);background:var(--card);color:var(--ink);border-radius:7px;padding:6px 11px;cursor:pointer;text-decoration:none;display:inline-block}
+.btn:hover{border-color:var(--acc)}.btn.pri{background:var(--acc);color:var(--accfg);border-color:var(--acc)}.btn.danger{color:var(--over)}
+.btn.lg{padding:9px 14px;font-size:15px}
+.bar{display:flex;gap:10px;flex-wrap:wrap;justify-content:space-between;align-items:center;margin-bottom:12px}
+.tabs{display:flex;gap:6px;flex-wrap:wrap}
+.tab{font-size:13px;font-weight:600;border:1px solid var(--line);color:var(--mute);border-radius:99px;padding:5px 12px;text-decoration:none}
+.tab.on{background:var(--acc);color:var(--accfg);border-color:var(--acc)}
+.sf{display:flex;gap:6px}.sf input{max-width:220px}
+.item{display:grid;grid-template-columns:1fr auto;gap:14px;padding:14px 0;border-top:1px solid var(--line)}
+.item:first-child{border-top:0}
+.nm{font-weight:700;font-size:17px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;overflow-wrap:anywhere}
+.badge{font-size:12px;font-weight:700;border-radius:99px;padding:2px 10px;letter-spacing:.02em}
+.b-PAID{background:var(--paidbg);color:var(--paid)}.b-UNPAID{background:var(--overbg);color:var(--over)}.b-NOFINE{background:var(--nfbg);color:var(--mute)}
+.bk{font-weight:600;font-size:12px;color:var(--mute)}.bk.Overdue{color:var(--over)}.bk.Returned{color:var(--paid)}
+.info{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:4px 16px;margin-top:8px;font-size:13px}
+.info div{min-width:0;overflow-wrap:anywhere}.info span{display:block;color:var(--mute);font-size:12px}
+.side{text-align:right;min-width:170px}.lbl{color:var(--mute);font-size:12px}.tot{font-weight:700;font-size:20px}
+.brk{color:var(--mute);font-size:13px}.fine{color:var(--over)}.zero{color:var(--mute)}
+.acts{display:flex;gap:6px;justify-content:flex-end;margin-top:8px;flex-wrap:wrap}.acts form{margin:0;display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.empty{text-align:center;padding:28px 8px;color:var(--mute)}
+@media(max-width:640px){.stats{grid-template-columns:1fr 1fr}.item{grid-template-columns:1fr}.side{text-align:left}.acts,.acts form{justify-content:flex-start}.sf input{max-width:none}.sf{width:100%}}
+</style>
+</head>
+<body>
+<div class="books-bg" aria-hidden="true">
+  <span>📗</span><span>📘</span><span>📕</span><span>📙</span>
+  <span>📖</span><span>📔</span><span>📚</span><span>📓</span>
+</div>
+<div class="wrap">
+<h1>Fines</h1>
+<p class="mute">Overdue books are fined ₱<?= RATE ?> per day. Fines and status update automatically.</p>
+
+<section class="stats">
+  <div class="stat"><span>Books borrowed</span><b><?= count($out) ?></b><span>not yet returned</span></div>
+  <div class="stat<?= $over ? ' hot' : '' ?>"><span>Overdue books</span><b><?= count($over) ?></b><span>fine growing daily</span></div>
+  <div class="stat<?= $unpd ? ' hot' : '' ?>"><span>Fines unpaid</span><b><?= h(money($sum($all,'balance'))) ?></b><span><?= plural(count($unpd), 'student') ?> owe a fine</span></div>
+  <div class="stat"><span>Fines collected</span><b><?= h(money($collected)) ?></b><span>already paid</span></div>
+</section>
+
+<section class="card">
+  <div class="bar">
+    <div class="tabs">
+      <?php foreach (['all'=>'All','borrowed'=>'Borrowed','overdue'=>'Overdue','returned'=>'Returned','unpaid'=>'Unpaid fines','erased'=>'Erased'] as $k => $lbl): ?>
+        <a class="tab<?= $f === $k ? ' on' : '' ?>" href="?f=<?= $k ?><?= $search !== '' ? '&q=' . urlencode($search) : '' ?>"><?= $lbl ?> <?= $counts[$k] ?></a>
+      <?php endforeach; ?>
+    </div>
+    <form class="sf" method="get"><input type="hidden" name="f" value="<?= h($f) ?>">
+      <input type="search" name="q" placeholder="Search student, course, book" value="<?= h($search) ?>" aria-label="Search"><button class="btn" type="submit">Search</button></form>
+  </div>
+
+  <?php if (!$rows): ?>
+    <div class="empty"><?php if ($all): ?>No records match this view.<?php else: ?>No borrow records yet. Try
+      <form method="post" style="display:inline"><input type="hidden" name="t" value="<?= h($_SESSION['t']) ?>"><input type="hidden" name="action" value="demo"><button class="btn" type="submit">loading sample data</button></form>.<?php endif; ?></div>
+  <?php endif; ?>
+
+  <?php foreach ($rows as $r): $dl = $r['erased'] ? null : daysBetween(date('Y-m-d'), $r['due_date']); ?>
+    <div class="item">
+      <div>
+        <div class="nm"><?= h($r['name']) ?>
+          <span class="badge b-<?= str_replace(' ', '', $r['fstatus']) ?>" title="Fine status"><?= h($r['fstatus']) ?></span>
+          <span class="bk <?= h($r['book']) ?>"><?= h($r['book']) ?></span></div>
+
+        <?php if ($r['erased']): ?>
+          <div class="info">
+            <div><span>Student ID</span><?= h($r['student_id'] ?: '—') ?></div>
+          </div>
+          <div class="erased-note">The borrowed book record was erased. Only this student's fine was kept.</div>
+        <?php else: ?>
+          <div class="info">
+            <div><span>Student ID</span><?= h($r['student_id'] ?: '—') ?></div>
+            <div><span>Course</span><?= h($r['course']) ?></div>
+            <div><span>Year level</span><?= h($r['year_level'] ?: '—') ?></div>
+            <div><span>Contact</span><?= h($r['contact'] ?: '—') ?></div>
+            <div><span>Borrowed book</span><?= h($r['book_title']) ?><?= $r['author'] ? ' · ' . h($r['author']) : '' ?><?= $r['book_no'] ? ' · #' . h($r['book_no']) : '' ?></div>
+            <div><span>Borrow date</span><?= h(fdate($r['borrow_date'])) ?></div>
+            <div><span>Due date</span><?= h(fdate($r['due_date'])) ?><?php if (!$r['returned_on']): ?> (<?= $r['over'] ? plural($r['over'], 'day') . ' overdue' : ($dl === 0 ? 'due today' : 'in ' . plural($dl, 'day')) ?>)<?php endif; ?></div>
+            <?php if ($r['returned_on']): ?><div><span>Returned on</span><?= h(fdate($r['returned_on'])) ?></div><?php endif; ?>
+          </div>
+        <?php endif; ?>
+      </div>
+      <div class="side">
+        <div class="lbl">Current fine</div>
+        <div class="tot <?= $r['fine'] ? 'fine' : 'zero' ?>"><?= h(money($r['fine'])) ?></div>
+        <?php if (!$r['erased']): ?>
+          <div class="brk"><?= $r['over'] ? plural($r['over'], 'day') . ' × ₱' . RATE : 'No overdue days' ?></div>
+        <?php endif; ?>
+        <?php if ($r['fine']): ?>
+          <div class="brk">Paid <?= h(money(min($r['fine_paid'], $r['fine']))) ?> · Balance <b><?= h(money($r['balance'])) ?></b></div>
+        <?php endif; ?>
+        <div class="acts">
+          <form method="post"><input type="hidden" name="t" value="<?= h($_SESSION['t']) ?>"><input type="hidden" name="id" value="<?= $r['id'] ?>"><input type="hidden" name="back" value="<?= h($back) ?>">
+            <?php if ($r['balance'] > 0): ?><button class="btn pri" name="action" value="payfine">Pay fine <?= h(money($r['balance'])) ?></button><?php endif; ?>
+            <?php if (!$r['erased']): ?>
+              <?php if ($r['returned_on']): ?><button class="btn" name="action" value="unreturn">Undo return</button>
+              <?php else: ?><button class="btn<?= $r['balance'] > 0 ? '' : ' pri' ?>" name="action" value="return">Return book</button><?php endif; ?>
+              <button class="btn danger" name="action" value="erase" onclick="return confirm('Erase the book record for this student? The fine amount will be kept.')">Erase book record</button>
+            <?php endif; ?>
+            <button class="btn danger" name="action" value="delete" onclick="return confirm('Delete this record completely, including the fine?')">Delete</button>
+          </form>
+        </div>
+      </div>
+    </div>
+  <?php endforeach; ?>
+</section>
+</div>
+</body>
+</html>
